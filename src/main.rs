@@ -40,6 +40,7 @@ struct Args {
 struct Job {
   name: String,
   command: String,
+  workdir: Option<String>,
   args: Option<Vec<String>>,
   env: Option<HashMap<String, String>>,
   inherit_env: Option<bool>,
@@ -64,6 +65,9 @@ impl Into<Command> for Job {
     let mut command = Command::new(self.command);
     if let Some(args) = self.args {
       command.args(args);
+    }
+    if let Some(workdir) = self.workdir {
+      command.current_dir(workdir);
     }
     if let Some(false) = self.inherit_env {
       command.env_clear();
@@ -137,12 +141,11 @@ impl ChildStdoutExt for AsyncBufReader<ChildStderr> {
 }
 
 trait CommandExt: Sized {
-  async fn run(&mut self, ct: CancellationToken, name: String) -> Result<i32>;
-  async fn take_run(mut self, ct: CancellationToken, name: String) -> Result<i32> { self.run(ct, name).await }
+  async fn run(self, ct: CancellationToken, name: String) -> Result<i32>;
 }
 
 impl CommandExt for Command {
-  async fn run(&mut self, ct: CancellationToken, name: String) -> Result<i32> {
+  async fn run(mut self, ct: CancellationToken, name: String) -> Result<i32> {
     let mut child = self.spawn()?;
     let stdout = child.stdout.take().ok()?;
     let stderr = child.stderr.take().ok()?;
@@ -150,21 +153,22 @@ impl CommandExt for Command {
     let mut stdout_bufreader = AsyncBufReader::new(stdout);
     let mut stderr_bufreader = AsyncBufReader::new(stderr);
 
-    loop {
+    let r = loop {
       select! {
         _ = ct.cancelled() => {
           child.kill().await?;
-          return Err(anyhow::anyhow!("Cancelled"));
+          break Err(anyhow::anyhow!("Cancelled"));
         }
         _ = stdout_bufreader.reprint(&name) => (),
         _ = stderr_bufreader.reprint(&name) => (),
         status = child.wait() => {
           let code = status?.code().ok()?;
           print(name.as_str(), format!("Process exited with code: {code}"), true);
-          return Ok(code);
+          break Ok(code);
         }
       }
-    }
+    };
+    r
   }
 }
 
@@ -174,20 +178,21 @@ async fn run_jobs(jobs: Vec<Job>) -> Result<()> {
     let ct = ct.clone();
     let cmd: Command = job.clone().into();
     let name = colored_name(&job.name, index);
-    cmd.take_run(ct, name)
+    cmd.run(ct, name)
   });
   let mut js = JoinSet::new();
   for job in futures {
     js.spawn(job);
   }
-  let w = Box::pin(js.join_all());
+  let mut w = Box::pin(js.join_all());
 
   select! {
     _ = tokio::signal::ctrl_c() => {
       println!("Ctrl-C received, cancelling jobs...");
       ct.cancel();
+      w.await;
     }
-    _ = w => {
+    _ = &mut w => {
       println!("All jobs completed");
     }
   }
