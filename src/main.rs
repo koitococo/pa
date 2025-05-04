@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs::File, io::BufReader, process};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::Colorize as _;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::FormatItem};
@@ -30,40 +30,84 @@ fn colored_name(name: &str, index: usize) -> String {
   colored_str.to_string()
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum ArgsConfigFormat {
+  Json,
+  Yaml,
+}
+
 #[derive(Parser, Debug)]
 struct Args {
-  #[clap(short, long, env, default_value = "pa.json")]
+  #[clap(short = 'c', long, env = "PA_CONFIG", default_value = "pa.json")]
   config_file: String,
+
+  #[clap(short = 'f', long, env = "PA_FORMAT", default_value = "json")]
+  config_format: ArgsConfigFormat,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum Cmdline {
+  Line(String),
+  Array(Vec<String>),
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Job {
-  name: String,
-  command: String,
+  cmd: Cmdline,
   workdir: Option<String>,
-  args: Option<Vec<String>>,
   env: Option<HashMap<String, String>>,
   inherit_env: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum JobDefination {
+  Cmdline(Cmdline),
+  Job(Job),
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
-  jobs: Vec<Job>,
+  jobs: HashMap<String, JobDefination>,
 }
 
 impl Config {
-  fn from_file(file: &str) -> Result<Self> {
+  fn from_json(file: &str) -> Result<Self> {
     let file = File::open(file)?;
     let reader = BufReader::new(file);
     let config: Config = serde_json::from_reader(reader)?;
     Ok(config)
   }
+
+  fn from_yaml(file: &str) -> Result<Self> {
+    let file = File::open(file)?;
+    let reader = BufReader::new(file);
+    let config: Config = serde_yml::from_reader(reader)?;
+    Ok(config)
+  }
+
+  fn from_args(args: &Args) -> Result<Self> {
+    match args.config_format {
+      ArgsConfigFormat::Json => Self::from_json(&args.config_file),
+      ArgsConfigFormat::Yaml => Self::from_yaml(&args.config_file),
+    }
+  }
 }
 
-impl Into<Command> for Job {
-  fn into(self) -> Command {
-    let mut command = Command::new(self.command);
-    if let Some(args) = self.args {
+impl TryInto<Command> for Job {
+  type Error = anyhow::Error;
+
+  fn try_into(self) -> Result<Command> {
+    let cmdline = match self.cmd {
+      Cmdline::Line(line) => line.split_ascii_whitespace().map(|s| s.to_string()).collect::<Vec<String>>(),
+      Cmdline::Array(array) => array,
+    };
+    let cmd = cmdline.get(0).ok_or_else(|| anyhow::anyhow!("Command is empty"))?;
+    let args = if cmdline.len() > 1 { Some(cmdline[1..].to_vec()) } else { None };
+    let mut command = Command::new(cmd);
+    if let Some(args) = args {
       command.args(args);
     }
     if let Some(workdir) = self.workdir {
@@ -78,7 +122,26 @@ impl Into<Command> for Job {
     command.stdin(process::Stdio::null());
     command.stdout(process::Stdio::piped());
     command.stderr(process::Stdio::piped());
-    command
+    Ok(command)
+  }
+}
+
+impl TryInto<Command> for JobDefination {
+  type Error = anyhow::Error;
+
+  fn try_into(self) -> Result<Command> {
+    match self {
+      JobDefination::Cmdline(cmdline) => {
+        let job = Job {
+          cmd: cmdline,
+          workdir: None,
+          env: None,
+          inherit_env: None,
+        };
+        job.try_into()
+      }
+      JobDefination::Job(job) => job.try_into(),
+    }
   }
 }
 
@@ -141,11 +204,12 @@ impl ChildStdoutExt for AsyncBufReader<ChildStderr> {
 }
 
 trait CommandExt: Sized {
-  async fn run(self, ct: CancellationToken, name: String) -> Result<i32>;
+  async fn run(self, ct: CancellationToken, name: &String) -> Result<()>;
 }
 
 impl CommandExt for Command {
-  async fn run(mut self, ct: CancellationToken, name: String) -> Result<i32> {
+  async fn run(mut self, ct: CancellationToken, name: &String) -> Result<()> {
+    print(name.as_str(), format!("Process start"), true);
     let mut child = self.spawn()?;
     let stdout = child.stdout.take().ok()?;
     let stderr = child.stderr.take().ok()?;
@@ -164,7 +228,7 @@ impl CommandExt for Command {
         status = child.wait() => {
           let code = status?.code().ok()?;
           print(name.as_str(), format!("Process exited with code: {code}"), true);
-          break Ok(code);
+          break Ok(());
         }
       }
     };
@@ -172,17 +236,21 @@ impl CommandExt for Command {
   }
 }
 
-async fn run_jobs(jobs: Vec<Job>) -> Result<()> {
+async fn run_jobs(jobs: HashMap<String, JobDefination>) -> Result<()> {
   let ct = CancellationToken::new();
-  let futures = jobs.iter().enumerate().map(|(index, job)| {
+  let mut js: JoinSet<()> = JoinSet::new();
+  for (index,(name,job)) in jobs.iter().enumerate() {
     let ct = ct.clone();
-    let cmd: Command = job.clone().into();
-    let name = colored_name(&job.name, index);
-    cmd.run(ct, name)
-  });
-  let mut js = JoinSet::new();
-  for job in futures {
-    js.spawn(job);
+    let Ok(cmd) : Result<Command> = job.clone().try_into() else {
+      eprintln!("Failed to convert job to command: {name}");
+      continue;
+    };
+    let name = colored_name(name, index);
+    js.spawn(async move {
+      if let Err(e) = cmd.run(ct, &name).await {
+        eprintln!("Failed to run job: {name}, error: {e}");
+      }
+    });
   }
   let mut w = Box::pin(js.join_all());
 
@@ -202,7 +270,7 @@ async fn run_jobs(jobs: Vec<Job>) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
   let args = Args::parse();
-  let config = Config::from_file(&args.config_file)?;
+  let config = Config::from_args(&args)?;
 
   run_jobs(config.jobs).await?;
   Ok(())
