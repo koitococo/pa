@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::BufReader, process};
+use std::{collections::HashMap, fs::File, io::BufReader, process, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -10,6 +10,7 @@ use tokio::{
   process::{ChildStderr, ChildStdout, Command},
   select,
   task::JoinSet,
+  time::{interval, sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -54,11 +55,25 @@ enum Cmdline {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+struct TestCommand {
+  interval: u64,
+  cmd: Cmdline,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum Delay {
+  ConstantDuration(u64),
+  Command(TestCommand),
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct Job {
   cmd: Cmdline,
   workdir: Option<String>,
   env: Option<HashMap<String, String>>,
   inherit_env: Option<bool>,
+  delay: Option<Delay>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -96,11 +111,11 @@ impl Config {
   }
 }
 
-impl TryInto<Command> for Job {
+impl TryInto<Command> for Cmdline {
   type Error = anyhow::Error;
 
   fn try_into(self) -> Result<Command> {
-    let cmdline = match self.cmd {
+    let cmdline = match self {
       Cmdline::Line(line) => line.split_ascii_whitespace().map(|s| s.to_string()).collect::<Vec<String>>(),
       Cmdline::Array(array) => array,
     };
@@ -110,6 +125,24 @@ impl TryInto<Command> for Job {
     if let Some(args) = args {
       command.args(args);
     }
+    Ok(command)
+  }
+}
+
+impl TryInto<Command> for &Cmdline {
+  type Error = anyhow::Error;
+
+  fn try_into(self) -> std::result::Result<Command, Self::Error> {
+    let self2 = self.clone();
+    self2.try_into()
+  }
+}
+
+impl TryInto<Command> for Job {
+  type Error = anyhow::Error;
+
+  fn try_into(self) -> Result<Command> {
+    let mut command: Command = self.cmd.try_into()?;
     if let Some(workdir) = self.workdir {
       command.current_dir(workdir);
     }
@@ -137,6 +170,7 @@ impl TryInto<Command> for JobDefination {
           workdir: None,
           env: None,
           inherit_env: None,
+          delay: None,
         };
         job.try_into()
       }
@@ -239,14 +273,45 @@ impl CommandExt for Command {
 async fn run_jobs(jobs: HashMap<String, JobDefination>) -> Result<()> {
   let ct = CancellationToken::new();
   let mut js: JoinSet<()> = JoinSet::new();
-  for (index,(name,job)) in jobs.iter().enumerate() {
+  for (index, (name, job)) in jobs.iter().enumerate() {
     let ct = ct.clone();
-    let Ok(cmd) : Result<Command> = job.clone().try_into() else {
+    let Ok(cmd): Result<Command> = job.clone().try_into() else {
       eprintln!("Failed to convert job to command: {name}");
       continue;
     };
     let name = colored_name(name, index);
+    let job = job.clone();
     js.spawn(async move {
+      if let JobDefination::Job(job) = job {
+        if let Some(delay) = job.delay {
+          match delay {
+            Delay::ConstantDuration(duration) => {
+              print(name.as_str(), format!("Sleeping for {duration}ms"), true);
+              sleep(Duration::from_millis(duration)).await;
+            }
+            Delay::Command(command) => {
+              let mut interval = interval(Duration::from_millis(command.interval));
+              loop {
+                interval.tick().await;
+                let Ok(mut command): Result<Command> = (&command.cmd).try_into() else {
+                  eprintln!("Failed to parse dependency cmdline: {name}");
+                  return;
+                };
+                let success = timeout(Duration::from_millis(10000), async {
+                  if let Ok(status) = command.status().await {
+                    return status.success();
+                  }
+                  false
+                })
+                .await;
+                if let Ok(true) = success {
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
       if let Err(e) = cmd.run(ct, &name).await {
         eprintln!("Failed to run job: {name}, error: {e}");
       }
