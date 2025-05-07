@@ -7,7 +7,7 @@ use serde::Deserialize;
 use time::{OffsetDateTime, format_description::FormatItem};
 use tokio::{
   io::{AsyncBufReadExt, BufReader as AsyncBufReader},
-  process::{ChildStderr, ChildStdout, Command},
+  process::{Child, ChildStderr, ChildStdout, Command},
   select,
   task::JoinSet,
   time::{interval, sleep},
@@ -46,6 +46,18 @@ fn print_to_console(name: &str, line: &str, is_err: bool) {
   } else {
     println!("{msg}");
   }
+}
+
+// macro_rules! format_to_console {
+//   ($name:expr, $fmt:literal $(, $args:expr)*) => {
+//     print_to_console($name, &format!($fmt $(, $args)*), false)
+//   };
+// }
+
+macro_rules! format_to_console_err {
+  ($name:expr, $fmt:literal $(, $args:expr)*) => {
+    print_to_console($name, &format!($fmt $(, $args)*), true)
+  };
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -128,12 +140,17 @@ impl Config {
     let config: Config = serde_yml::from_reader(reader)?;
     Ok(config)
   }
+}
 
-  fn from_args(args: &Args) -> Result<Self> {
-    match args.config_format {
-      ArgsConfigFormat::Json => Self::from_json(&args.config_file),
-      ArgsConfigFormat::Yaml => Self::from_yaml(&args.config_file),
-    }
+impl TryInto<Config> for Args {
+  type Error = anyhow::Error;
+
+  fn try_into(self) -> Result<Config> {
+    let config = match self.config_format {
+      ArgsConfigFormat::Json => Config::from_json(&self.config_file),
+      ArgsConfigFormat::Yaml => Config::from_yaml(&self.config_file),
+    }?;
+    Ok(config)
   }
 }
 
@@ -151,6 +168,7 @@ impl TryInto<Command> for Cmdline {
     if let Some(args) = args {
       command.args(args);
     }
+    command.kill_on_drop(true);
     Ok(command)
   }
 }
@@ -173,27 +191,6 @@ impl TryInto<Command> for Job {
     command.stdout(process::Stdio::piped());
     command.stderr(process::Stdio::piped());
     Ok(command)
-  }
-}
-
-impl TryInto<Command> for JobDefination {
-  type Error = anyhow::Error;
-
-  fn try_into(self) -> Result<Command> {
-    match self {
-      JobDefination::Cmdline(cmdline) => {
-        let job = Job {
-          cmd: cmdline,
-          workdir: None,
-          env: None,
-          inherit_env: None,
-          delay: None,
-          restart: None,
-        };
-        job.try_into()
-      }
-      JobDefination::Job(job) => job.try_into(),
-    }
   }
 }
 
@@ -227,10 +224,9 @@ impl ChildStdoutExt for AsyncBufReader<ChildStdout> {
   async fn reprint(&mut self, name: &str) -> Result<()> {
     let mut buf = String::new();
     self.read_line(&mut buf).await?;
-    if buf.is_empty() {
-      return Ok(());
+    if !buf.is_empty() {
+      print_to_console(name, buf.as_str(), false);
     }
-    print_to_console(name, buf.as_str(), false);
     Ok(())
   }
 }
@@ -239,11 +235,54 @@ impl ChildStdoutExt for AsyncBufReader<ChildStderr> {
   async fn reprint(&mut self, name: &str) -> Result<()> {
     let mut buf = String::new();
     self.read_line(&mut buf).await?;
-    if buf.is_empty() {
-      return Ok(());
+    if !buf.is_empty() {
+      print_to_console(name, buf.as_str(), true);
     }
-    print_to_console(name, buf.as_str(), true);
     Ok(())
+  }
+}
+
+trait ChildExt {
+  async fn exit_ok(&mut self, name: &str) -> Result<bool>;
+  async fn stop(&mut self, name: &str) -> Result<bool>;
+  fn take_output(&mut self) -> Result<(AsyncBufReader<ChildStdout>, AsyncBufReader<ChildStderr>)>;
+}
+
+impl ChildExt for Child {
+  async fn exit_ok(&mut self, name: &str) -> Result<bool> {
+    let status = self.wait().await?;
+    let code = status.code().ok()?;
+    format_to_console_err!(name, "Process exited with code: {code}");
+    Ok(status.success())
+  }
+
+  async fn stop(&mut self, _: &str) -> Result<bool> {
+    #[cfg(unix)]
+    {
+      if let Some(pid) = self.id() {
+        let pid = pid as i32;
+        if let Err(e) = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGTERM) {
+          eprintln!("Failed to send SIGTERM to process {pid}: {e}");
+        } else {
+          let _ = tokio::time::timeout(Duration::from_secs(5), self.wait()).await;
+        }
+      } else {
+        eprintln!("Failed to get process ID");
+      }
+    }
+
+    self.kill().await?;
+    Err(anyhow::anyhow!("Cancelled"))
+  }
+
+  fn take_output(&mut self) -> Result<(AsyncBufReader<ChildStdout>, AsyncBufReader<ChildStderr>)> {
+    let stdout = self.stdout.take().ok()?;
+    let stderr = self.stderr.take().ok()?;
+
+    let stdout_bufreader = AsyncBufReader::new(stdout);
+    let stderr_bufreader = AsyncBufReader::new(stderr);
+
+    Ok((stdout_bufreader, stderr_bufreader))
   }
 }
 
@@ -254,27 +293,27 @@ trait CommandExt: Sized {
 
 impl CommandExt for Command {
   async fn run(mut self, ct: CancellationToken, name: &str) -> Result<bool> {
-    print_to_console(name, "Process start".to_string().as_str(), true);
+    print_to_console(name, "Process start", true);
     let mut child = self.spawn()?;
-    let stdout = child.stdout.take().ok()?;
-    let stderr = child.stderr.take().ok()?;
 
-    let mut stdout_bufreader = AsyncBufReader::new(stdout);
-    let mut stderr_bufreader = AsyncBufReader::new(stderr);
+    let (mut stdout, mut stderr) = match child.take_output() {
+      Ok(v) => v,
+      Err(e) => {
+        format_to_console_err!(name, "Failed to take output, error: {e}");
+        child.kill().await?;
+        return Err(e);
+      }
+    };
 
     loop {
       select! {
         _ = ct.cancelled() => {
-          child.kill().await?;
-          break Err(anyhow::anyhow!("Cancelled"));
+          break child.stop(name).await
         }
-        _ = stdout_bufreader.reprint(name) => (),
-        _ = stderr_bufreader.reprint(name) => (),
-        status = child.wait() => {
-          let status = status?;
-          let code = status.code().ok()?;
-          print_to_console(name, format!("Process exited with code: {code}").as_str(), true);
-          break Ok(status.success());
+        _ = stdout.reprint(name) => (),
+        _ = stderr.reprint(name) => (),
+        success = child.exit_ok(name) => {
+          break Ok(success?)
         }
       }
     }
@@ -339,8 +378,15 @@ impl JobExt for &Cmdline {
   async fn delay(self, _: &str) -> Result<()> { Ok(()) }
 
   async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
-    let self2 = self.clone();
-    let command: Command = self2.try_into()?;
+    let job = Job {
+      cmd: self.clone(),
+      workdir: None,
+      env: None,
+      inherit_env: None,
+      delay: None,
+      restart: None,
+    };
+    let command: Command = job.try_into()?;
     command.run(ct, name).await
   }
 }
@@ -350,7 +396,7 @@ impl JobExt for &Job {
     if let Some(delay) = &self.delay {
       match delay {
         Delay::ConstantDuration(duration) => {
-          print_to_console(name, format!("Sleeping for {duration}ms").as_str(), true);
+          format_to_console_err!(name, "Sleeping for {duration}ms");
           sleep(Duration::from_millis(*duration)).await;
         }
         Delay::Command(command) => {
@@ -380,7 +426,7 @@ impl JobExt for &Job {
           false
         }
         Err(e) => {
-          print_to_console(name, format!("Failed to run job, error: {e}").as_str(), true);
+          format_to_console_err!(name, "Job failed, error: {e}");
           false
         }
       };
@@ -419,26 +465,31 @@ impl JobExt for &JobDefination {
 }
 
 impl JobDefination {
-  async fn main(self, ct: CancellationToken, name: &String) {
+  async fn run(self, ct: CancellationToken, name: &String) {
     if let Err(e) = self.delay(name).await {
-      eprintln!("Failed to delay job: {name}, error: {e}");
+      format_to_console_err!(name, "Failed to delay job, error: {e}");
       return;
     }
     if let Err(e) = self.run_with_retry(ct, name).await {
-      eprintln!("Failed to run job: {name}, error: {e}");
+      format_to_console_err!(name, "Failed to run job, error: {e}");
     }
   }
 }
 
-async fn run_jobs(jobs: HashMap<String, JobDefination>) -> Result<()> {
+async fn run_jobs<Jobs>(jobs: Jobs) -> Result<()>
+where
+  Jobs: IntoIterator<Item = (String, JobDefination)>,
+  Jobs::IntoIter: Send,
+  Jobs::Item: Send,
+{
   let ct = CancellationToken::new();
   let mut js: JoinSet<()> = JoinSet::new();
-  for (index, (name, job)) in jobs.iter().enumerate() {
+  for (index, (name, job)) in jobs.into_iter().enumerate() {
     let ct = ct.clone();
-    let name = colored_name(name, index);
+    let name = colored_name(name.as_str(), index);
     let job = job.clone();
     js.spawn(async move {
-      job.main(ct, &name).await;
+      job.run(ct, &name).await;
     });
   }
   let mut w = Box::pin(js.join_all());
@@ -459,7 +510,7 @@ async fn run_jobs(jobs: HashMap<String, JobDefination>) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
   let args = Args::parse();
-  let config = Config::from_args(&args)?;
+  let config: Config = args.try_into()?;
 
   run_jobs(config.jobs).await?;
   Ok(())
