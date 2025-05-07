@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fs::File, io::BufReader, process, time::Duration};
+use std::{
+  collections::HashMap,
+  fs::File,
+  io::{BufReader, Read},
+  process,
+  time::Duration,
+};
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -65,15 +71,16 @@ macro_rules! format_to_console_err {
 enum ArgsConfigFormat {
   Json,
   Yaml,
+  Toml,
 }
 
 #[derive(Parser, Debug)]
 struct Args {
-  #[clap(short = 'c', long, env = "PA_CONFIG", default_value = "pa.json")]
-  config_file: String,
+  #[clap(short = 'c', long, env = "PA_CONFIG")]
+  config_file: Option<String>,
 
-  #[clap(short = 'f', long, env = "PA_FORMAT", default_value = "json")]
-  config_format: ArgsConfigFormat,
+  #[clap(short = 'f', long, env = "PA_FORMAT")]
+  config_format: Option<ArgsConfigFormat>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -127,18 +134,35 @@ struct Config {
 }
 
 impl Config {
-  fn from_json(file: &str) -> Result<Self> {
+  fn from_file(file: &str, ty: ArgsConfigFormat) -> Result<Self> {
     let file = File::open(file)?;
-    let reader = BufReader::new(file);
-    let config: Config = serde_json::from_reader(reader)?;
+    let mut reader = BufReader::new(file);
+    let config: Config = match ty {
+      ArgsConfigFormat::Json => serde_json::from_reader(reader)?,
+      ArgsConfigFormat::Yaml => serde_yml::from_reader(reader)?,
+      ArgsConfigFormat::Toml => {
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        toml::from_str(buf.as_str())?
+      }
+    };
     Ok(config)
   }
 
-  fn from_yaml(file: &str) -> Result<Self> {
-    let file = File::open(file)?;
-    let reader = BufReader::new(file);
-    let config: Config = serde_yml::from_reader(reader)?;
-    Ok(config)
+  fn auto_find() -> Result<Self> {
+    if std::fs::exists("./pa.yaml").unwrap_or(false) {
+      return Self::from_file("./pa.yaml", ArgsConfigFormat::Yaml);
+    }
+    if std::fs::exists("./pa.json").unwrap_or(false) {
+      return Self::from_file("./pa.json", ArgsConfigFormat::Json);
+    }
+    if std::fs::exists("./pa.yml").unwrap_or(false) {
+      return Self::from_file("./pa.yml", ArgsConfigFormat::Yaml);
+    }
+    if std::fs::exists("./pa.toml").unwrap_or(false) {
+      return Self::from_file("./pa.toml", ArgsConfigFormat::Toml);
+    }
+    Err(anyhow::anyhow!("No config file found"))
   }
 }
 
@@ -146,11 +170,25 @@ impl TryInto<Config> for Args {
   type Error = anyhow::Error;
 
   fn try_into(self) -> Result<Config> {
-    let config = match self.config_format {
-      ArgsConfigFormat::Json => Config::from_json(&self.config_file),
-      ArgsConfigFormat::Yaml => Config::from_yaml(&self.config_file),
-    }?;
-    Ok(config)
+    if let Some(file) = self.config_file {
+      let config_type = match self.config_format {
+        Some(v) => v,
+        None => {
+          let ext = file.split('.').last().unwrap_or("");
+          match ext {
+            "json" => ArgsConfigFormat::Json,
+            "yaml" | "yml" => ArgsConfigFormat::Yaml,
+            "toml" => ArgsConfigFormat::Toml,
+            _ => {
+              return Err(anyhow::anyhow!("Unsupported file format: {ext}"));
+            }
+          }
+        }
+      };
+      Ok(Config::from_file(&file, config_type)?)
+    } else {
+      Config::auto_find()
+    }
   }
 }
 
@@ -195,20 +233,15 @@ impl TryInto<Command> for Job {
 }
 
 impl From<Option<Restart>> for Restart {
-  fn from(restart: Option<Restart>) -> Self {
-    match restart {
-      Some(restart) => restart,
-      None => Restart::Never,
-    }
-  }
+  fn from(restart: Option<Restart>) -> Self { restart.unwrap_or(Restart::Never) }
 }
 
 trait OptionExt<T> {
-  fn ok(self) -> Result<T>;
+  fn some(self) -> Result<T>;
 }
 
 impl<T> OptionExt<T> for Option<T> {
-  fn ok(self) -> Result<T> {
+  fn some(self) -> Result<T> {
     match self {
       Some(value) => Ok(value),
       None => Err(anyhow::anyhow!("Option was None")),
@@ -251,7 +284,7 @@ trait ChildExt {
 impl ChildExt for Child {
   async fn exit_ok(&mut self, name: &str) -> Result<bool> {
     let status = self.wait().await?;
-    let code = status.code().ok()?;
+    let code = status.code().some()?;
     format_to_console_err!(name, "Process exited with code: {code}");
     Ok(status.success())
   }
@@ -276,8 +309,8 @@ impl ChildExt for Child {
   }
 
   fn take_output(&mut self) -> Result<(AsyncBufReader<ChildStdout>, AsyncBufReader<ChildStderr>)> {
-    let stdout = self.stdout.take().ok()?;
-    let stderr = self.stderr.take().ok()?;
+    let stdout = self.stdout.take().some()?;
+    let stderr = self.stderr.take().some()?;
 
     let stdout_bufreader = AsyncBufReader::new(stdout);
     let stderr_bufreader = AsyncBufReader::new(stderr);
