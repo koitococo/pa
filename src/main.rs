@@ -42,9 +42,9 @@ fn print_to_console(name: &str, line: &str, is_err: bool) {
   let msg = format!("[{timestamp}] {name}:: {line}");
 
   if is_err {
-    eprintln!("{}", msg);
+    eprintln!("{msg}");
   } else {
-    println!("{}", msg);
+    println!("{msg}");
   }
 }
 
@@ -145,7 +145,7 @@ impl TryInto<Command> for Cmdline {
       Cmdline::Line(line) => line.split_ascii_whitespace().map(|s| s.to_string()).collect::<Vec<String>>(),
       Cmdline::Array(array) => array,
     };
-    let cmd = cmdline.get(0).ok_or_else(|| anyhow::anyhow!("Command is empty"))?;
+    let cmd = cmdline.first().ok_or_else(|| anyhow::anyhow!("Command is empty"))?;
     let args = if cmdline.len() > 1 { Some(cmdline[1..].to_vec()) } else { None };
     let mut command = Command::new(cmd);
     if let Some(args) = args {
@@ -230,7 +230,7 @@ impl ChildStdoutExt for AsyncBufReader<ChildStdout> {
     if buf.is_empty() {
       return Ok(());
     }
-    print_to_console(&name, buf.as_str(), false);
+    print_to_console(name, buf.as_str(), false);
     Ok(())
   }
 }
@@ -248,13 +248,13 @@ impl ChildStdoutExt for AsyncBufReader<ChildStderr> {
 }
 
 trait CommandExt: Sized {
-  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool>;
+  async fn run(self, ct: CancellationToken, name: &str) -> Result<bool>;
   async fn success(self, timeout: u64) -> Result<bool>;
 }
 
 impl CommandExt for Command {
-  async fn run(mut self, ct: CancellationToken, name: &String) -> Result<bool> {
-    print_to_console(name.as_str(), format!("Process start").as_str(), true);
+  async fn run(mut self, ct: CancellationToken, name: &str) -> Result<bool> {
+    print_to_console(name, "Process start".to_string().as_str(), true);
     let mut child = self.spawn()?;
     let stdout = child.stdout.take().ok()?;
     let stderr = child.stderr.take().ok()?;
@@ -268,12 +268,12 @@ impl CommandExt for Command {
           child.kill().await?;
           break Err(anyhow::anyhow!("Cancelled"));
         }
-        _ = stdout_bufreader.reprint(&name) => (),
-        _ = stderr_bufreader.reprint(&name) => (),
+        _ = stdout_bufreader.reprint(name) => (),
+        _ = stderr_bufreader.reprint(name) => (),
         status = child.wait() => {
           let status = status?;
           let code = status.code().ok()?;
-          print_to_console(name.as_str(), format!("Process exited with code: {code}").as_str(), true);
+          print_to_console(name, format!("Process exited with code: {code}").as_str(), true);
           break Ok(status.success());
         }
       }
@@ -287,7 +287,7 @@ impl CommandExt for Command {
 }
 
 impl CommandExt for &Cmdline {
-  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run(self, ct: CancellationToken, name: &str) -> Result<bool> {
     let self2 = self.clone();
     let command: Command = self2.try_into()?;
     command.run(ct, name).await
@@ -301,7 +301,7 @@ impl CommandExt for &Cmdline {
 }
 
 impl CommandExt for &Job {
-  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run(self, ct: CancellationToken, name: &str) -> Result<bool> {
     let self2 = self.clone();
     let command: Command = self2.try_into()?;
     command.run(ct, name).await
@@ -315,7 +315,7 @@ impl CommandExt for &Job {
 }
 
 impl CommandExt for &JobDefination {
-  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run(self, ct: CancellationToken, name: &str) -> Result<bool> {
     match self {
       JobDefination::Cmdline(cmdline) => cmdline.run(ct, name).await,
       JobDefination::Job(job) => job.run(ct, name).await,
@@ -332,13 +332,13 @@ impl CommandExt for &JobDefination {
 
 trait JobExt {
   async fn delay(self, name: &str) -> Result<()>;
-  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool>;
+  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool>;
 }
 
 impl JobExt for &Cmdline {
   async fn delay(self, _: &str) -> Result<()> { Ok(()) }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
     let self2 = self.clone();
     let command: Command = self2.try_into()?;
     command.run(ct, name).await
@@ -367,7 +367,7 @@ impl JobExt for &Job {
     Ok(())
   }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
     let restart = Restart::from(self.restart.clone());
     loop {
       let success = match self.run(ct.clone(), name).await {
@@ -410,7 +410,7 @@ impl JobExt for &JobDefination {
     }
   }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
     match self {
       JobDefination::Cmdline(cmdline) => cmdline.run_with_retry(ct, name).await,
       JobDefination::Job(job) => job.run_with_retry(ct, name).await,
@@ -420,11 +420,11 @@ impl JobExt for &JobDefination {
 
 impl JobDefination {
   async fn main(self, ct: CancellationToken, name: &String) {
-    if let Err(e) = self.delay(&name).await {
+    if let Err(e) = self.delay(name).await {
       eprintln!("Failed to delay job: {name}, error: {e}");
       return;
     }
-    if let Err(e) = self.run_with_retry(ct, &name).await {
+    if let Err(e) = self.run_with_retry(ct, name).await {
       eprintln!("Failed to run job: {name}, error: {e}");
     }
   }
