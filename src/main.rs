@@ -10,7 +10,7 @@ use tokio::{
   process::{ChildStderr, ChildStdout, Command},
   select,
   task::JoinSet,
-  time::{interval, sleep, timeout},
+  time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +29,23 @@ fn colored_name(name: &str, index: usize) -> String {
     _ => unreachable!(),
   };
   colored_str.to_string()
+}
+
+fn print_to_console(name: &str, line: &str, is_err: bool) {
+  let Ok(Ok(timestamp)) = OffsetDateTime::now_local().map(|t| t.format(TIMESTAMP_FORMAT_OFFSET)) else {
+    eprintln!("Failed to get local time");
+    return;
+  };
+
+  let timestamp = format!("{timestamp:<29}").bright_black().to_string();
+  let line = line.trim();
+  let msg = format!("[{timestamp}] {name}:: {line}");
+
+  if is_err {
+    eprintln!("{}", msg);
+  } else {
+    println!("{}", msg);
+  }
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -68,12 +85,21 @@ enum Delay {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+enum Restart {
+  Always,
+  Never,
+  OnFailure,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct Job {
   cmd: Cmdline,
   workdir: Option<String>,
   env: Option<HashMap<String, String>>,
   inherit_env: Option<bool>,
   delay: Option<Delay>,
+  restart: Option<Restart>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -129,15 +155,6 @@ impl TryInto<Command> for Cmdline {
   }
 }
 
-impl TryInto<Command> for &Cmdline {
-  type Error = anyhow::Error;
-
-  fn try_into(self) -> std::result::Result<Command, Self::Error> {
-    let self2 = self.clone();
-    self2.try_into()
-  }
-}
-
 impl TryInto<Command> for Job {
   type Error = anyhow::Error;
 
@@ -171,10 +188,20 @@ impl TryInto<Command> for JobDefination {
           env: None,
           inherit_env: None,
           delay: None,
+          restart: None,
         };
         job.try_into()
       }
       JobDefination::Job(job) => job.try_into(),
+    }
+  }
+}
+
+impl From<Option<Restart>> for Restart {
+  fn from(restart: Option<Restart>) -> Self {
+    match restart {
+      Some(restart) => restart,
+      None => Restart::Never,
     }
   }
 }
@@ -192,23 +219,6 @@ impl<T> OptionExt<T> for Option<T> {
   }
 }
 
-fn print(name: &str, line: String, is_err: bool) {
-  let Ok(Ok(timestamp)) = OffsetDateTime::now_local().map(|t| t.format(TIMESTAMP_FORMAT_OFFSET)) else {
-    eprintln!("Failed to get local time");
-    return;
-  };
-
-  let timestamp = format!("{timestamp:<29}").bright_black().to_string();
-  let line = line.trim();
-  let msg = format!("[{timestamp}] {name}:: {line}");
-
-  if is_err {
-    eprintln!("{}", msg);
-  } else {
-    println!("{}", msg);
-  }
-}
-
 trait ChildStdoutExt {
   async fn reprint(&mut self, name: &str) -> Result<()>;
 }
@@ -220,7 +230,7 @@ impl ChildStdoutExt for AsyncBufReader<ChildStdout> {
     if buf.is_empty() {
       return Ok(());
     }
-    print(&name, buf, false);
+    print_to_console(&name, buf.as_str(), false);
     Ok(())
   }
 }
@@ -232,18 +242,19 @@ impl ChildStdoutExt for AsyncBufReader<ChildStderr> {
     if buf.is_empty() {
       return Ok(());
     }
-    print(name, buf, true);
+    print_to_console(name, buf.as_str(), true);
     Ok(())
   }
 }
 
 trait CommandExt: Sized {
-  async fn run(self, ct: CancellationToken, name: &String) -> Result<()>;
+  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool>;
+  async fn success(self, timeout: u64) -> Result<bool>;
 }
 
 impl CommandExt for Command {
-  async fn run(mut self, ct: CancellationToken, name: &String) -> Result<()> {
-    print(name.as_str(), format!("Process start"), true);
+  async fn run(mut self, ct: CancellationToken, name: &String) -> Result<bool> {
+    print_to_console(name.as_str(), format!("Process start").as_str(), true);
     let mut child = self.spawn()?;
     let stdout = child.stdout.take().ok()?;
     let stderr = child.stderr.take().ok()?;
@@ -251,7 +262,7 @@ impl CommandExt for Command {
     let mut stdout_bufreader = AsyncBufReader::new(stdout);
     let mut stderr_bufreader = AsyncBufReader::new(stderr);
 
-    let r = loop {
+    loop {
       select! {
         _ = ct.cancelled() => {
           child.kill().await?;
@@ -260,13 +271,162 @@ impl CommandExt for Command {
         _ = stdout_bufreader.reprint(&name) => (),
         _ = stderr_bufreader.reprint(&name) => (),
         status = child.wait() => {
-          let code = status?.code().ok()?;
-          print(name.as_str(), format!("Process exited with code: {code}"), true);
-          break Ok(());
+          let status = status?;
+          let code = status.code().ok()?;
+          print_to_console(name.as_str(), format!("Process exited with code: {code}").as_str(), true);
+          break Ok(status.success());
         }
       }
-    };
-    r
+    }
+  }
+
+  async fn success(mut self, timeout: u64) -> Result<bool> {
+    let success = tokio::time::timeout(Duration::from_millis(timeout), async { self.status().await }).await;
+    Ok(success??.success())
+  }
+}
+
+impl CommandExt for &Cmdline {
+  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    let self2 = self.clone();
+    let command: Command = self2.try_into()?;
+    command.run(ct, name).await
+  }
+
+  async fn success(self, timeout: u64) -> Result<bool> {
+    let self2 = self.clone();
+    let command: Command = self2.try_into()?;
+    command.success(timeout).await
+  }
+}
+
+impl CommandExt for &Job {
+  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    let self2 = self.clone();
+    let command: Command = self2.try_into()?;
+    command.run(ct, name).await
+  }
+
+  async fn success(self, timeout: u64) -> Result<bool> {
+    let self2 = self.clone();
+    let command: Command = self2.try_into()?;
+    command.success(timeout).await
+  }
+}
+
+impl CommandExt for &JobDefination {
+  async fn run(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    match self {
+      JobDefination::Cmdline(cmdline) => cmdline.run(ct, name).await,
+      JobDefination::Job(job) => job.run(ct, name).await,
+    }
+  }
+
+  async fn success(self, timeout: u64) -> Result<bool> {
+    match self {
+      JobDefination::Cmdline(cmdline) => cmdline.success(timeout).await,
+      JobDefination::Job(job) => job.success(timeout).await,
+    }
+  }
+}
+
+trait JobExt {
+  async fn delay(self, name: &str) -> Result<()>;
+  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool>;
+}
+
+impl JobExt for &Cmdline {
+  async fn delay(self, _: &str) -> Result<()> { Ok(()) }
+
+  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    let self2 = self.clone();
+    let command: Command = self2.try_into()?;
+    command.run(ct, name).await
+  }
+}
+
+impl JobExt for &Job {
+  async fn delay(self, name: &str) -> Result<()> {
+    if let Some(delay) = &self.delay {
+      match delay {
+        Delay::ConstantDuration(duration) => {
+          print_to_console(name, format!("Sleeping for {duration}ms").as_str(), true);
+          sleep(Duration::from_millis(*duration)).await;
+        }
+        Delay::Command(command) => {
+          let mut interval = interval(Duration::from_millis(command.interval));
+          loop {
+            interval.tick().await;
+            if let Ok(true) = command.cmd.success(10000).await {
+              break;
+            }
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
+  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    let restart = Restart::from(self.restart.clone());
+    loop {
+      let success = match self.run(ct.clone(), name).await {
+        Ok(true) => {
+          println!("Job {name} completed successfully");
+          true
+        }
+        Ok(false) => {
+          print_to_console(name, "Job failed", true);
+          false
+        }
+        Err(e) => {
+          print_to_console(name, format!("Failed to run job, error: {e}").as_str(), true);
+          false
+        }
+      };
+      match restart {
+        Restart::Always => {
+          continue;
+        }
+        Restart::Never => break,
+        Restart::OnFailure => {
+          if success {
+            break;
+          } else {
+            continue;
+          }
+        }
+      }
+    }
+    Ok(true)
+  }
+}
+
+impl JobExt for &JobDefination {
+  async fn delay(self, name: &str) -> Result<()> {
+    match self {
+      JobDefination::Cmdline(cmdline) => cmdline.delay(name).await,
+      JobDefination::Job(job) => job.delay(name).await,
+    }
+  }
+
+  async fn run_with_retry(self, ct: CancellationToken, name: &String) -> Result<bool> {
+    match self {
+      JobDefination::Cmdline(cmdline) => cmdline.run_with_retry(ct, name).await,
+      JobDefination::Job(job) => job.run_with_retry(ct, name).await,
+    }
+  }
+}
+
+impl JobDefination {
+  async fn main(self, ct: CancellationToken, name: &String) {
+    if let Err(e) = self.delay(&name).await {
+      eprintln!("Failed to delay job: {name}, error: {e}");
+      return;
+    }
+    if let Err(e) = self.run_with_retry(ct, &name).await {
+      eprintln!("Failed to run job: {name}, error: {e}");
+    }
   }
 }
 
@@ -275,46 +435,10 @@ async fn run_jobs(jobs: HashMap<String, JobDefination>) -> Result<()> {
   let mut js: JoinSet<()> = JoinSet::new();
   for (index, (name, job)) in jobs.iter().enumerate() {
     let ct = ct.clone();
-    let Ok(cmd): Result<Command> = job.clone().try_into() else {
-      eprintln!("Failed to convert job to command: {name}");
-      continue;
-    };
     let name = colored_name(name, index);
     let job = job.clone();
     js.spawn(async move {
-      if let JobDefination::Job(job) = job {
-        if let Some(delay) = job.delay {
-          match delay {
-            Delay::ConstantDuration(duration) => {
-              print(name.as_str(), format!("Sleeping for {duration}ms"), true);
-              sleep(Duration::from_millis(duration)).await;
-            }
-            Delay::Command(command) => {
-              let mut interval = interval(Duration::from_millis(command.interval));
-              loop {
-                interval.tick().await;
-                let Ok(mut command): Result<Command> = (&command.cmd).try_into() else {
-                  eprintln!("Failed to parse dependency cmdline: {name}");
-                  return;
-                };
-                let success = timeout(Duration::from_millis(10000), async {
-                  if let Ok(status) = command.status().await {
-                    return status.success();
-                  }
-                  false
-                })
-                .await;
-                if let Ok(true) = success {
-                  break;
-                }
-              }
-            }
-          }
-        }
-      }
-      if let Err(e) = cmd.run(ct, &name).await {
-        eprintln!("Failed to run job: {name}, error: {e}");
-      }
+      job.main(ct, &name).await;
     });
   }
   let mut w = Box::pin(js.join_all());
