@@ -403,14 +403,14 @@ impl CommandExt for &JobDefination {
 }
 
 trait JobExt {
-  async fn delay(self, name: &str) -> Result<()>;
-  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool>;
+  async fn delay(self, name: &str, ct: CancellationToken) -> Result<()>;
+  async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool>;
 }
 
 impl JobExt for &Cmdline {
-  async fn delay(self, _: &str) -> Result<()> { Ok(()) }
+  async fn delay(self, _: &str, _: CancellationToken) -> Result<()> { Ok(()) }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
+  async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool> {
     let job = Job {
       cmd: self.clone(),
       workdir: None,
@@ -425,12 +425,18 @@ impl JobExt for &Cmdline {
 }
 
 impl JobExt for &Job {
-  async fn delay(self, name: &str) -> Result<()> {
+  async fn delay(self, name: &str, ct: CancellationToken) -> Result<()> {
     if let Some(delay) = &self.delay {
       match delay {
         Delay::ConstantDuration(duration) => {
           format_to_console_err!(name, "Sleeping for {duration}ms");
-          sleep(Duration::from_millis(*duration)).await;
+          select! {
+            _ = sleep(Duration::from_millis(*duration)) => (),
+            _ = ct.cancelled() => {
+              format_to_console_err!(name, "Cancelled");
+              return Err(anyhow::anyhow!("Cancelled"));
+            }
+          };
         }
         Delay::Command(command) => {
           let mut interval = interval(Duration::from_millis(command.interval));
@@ -446,7 +452,7 @@ impl JobExt for &Job {
     Ok(())
   }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
+  async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool> {
     let restart = Restart::from(self.restart.clone());
     loop {
       let success = match self.run(ct.clone(), name).await {
@@ -482,28 +488,28 @@ impl JobExt for &Job {
 }
 
 impl JobExt for &JobDefination {
-  async fn delay(self, name: &str) -> Result<()> {
+  async fn delay(self, name: &str, ct: CancellationToken) -> Result<()> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.delay(name).await,
-      JobDefination::Job(job) => job.delay(name).await,
+      JobDefination::Cmdline(cmdline) => cmdline.delay(name, ct).await,
+      JobDefination::Job(job) => job.delay(name, ct).await,
     }
   }
 
-  async fn run_with_retry(self, ct: CancellationToken, name: &str) -> Result<bool> {
+  async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.run_with_retry(ct, name).await,
-      JobDefination::Job(job) => job.run_with_retry(ct, name).await,
+      JobDefination::Cmdline(cmdline) => cmdline.run_with_retry(name, ct).await,
+      JobDefination::Job(job) => job.run_with_retry(name, ct).await,
     }
   }
 }
 
 impl JobDefination {
   async fn run(self, ct: CancellationToken, name: &String) {
-    if let Err(e) = self.delay(name).await {
+    if let Err(e) = self.delay(name, ct.clone()).await {
       format_to_console_err!(name, "Failed to delay job, error: {e}");
       return;
     }
-    if let Err(e) = self.run_with_retry(ct, name).await {
+    if let Err(e) = self.run_with_retry(name, ct).await {
       format_to_console_err!(name, "Failed to run job, error: {e}");
     }
   }
