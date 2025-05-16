@@ -112,7 +112,7 @@ enum Restart {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct Job {
+struct SingleJob {
   cmd: Cmdline,
   workdir: Option<String>,
   env: Option<HashMap<String, String>>,
@@ -123,16 +123,16 @@ struct Job {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
-enum JobDefination {
+enum Job {
   Cmdline(Cmdline),
-  Job(Job),
+  Job(SingleJob),
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 enum Jobs {
-  Single(HashMap<String, JobDefination>),
-  Multiple(Vec<HashMap<String, JobDefination>>),
+  Single(HashMap<String, Job>),
+  Multiple(Vec<HashMap<String, Job>>),
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -218,7 +218,7 @@ impl TryInto<Command> for Cmdline {
   }
 }
 
-impl TryInto<Command> for Job {
+impl TryInto<Command> for SingleJob {
   type Error = anyhow::Error;
 
   fn try_into(self) -> Result<Command> {
@@ -379,7 +379,7 @@ impl CommandExt for &Cmdline {
   }
 }
 
-impl CommandExt for &Job {
+impl CommandExt for &SingleJob {
   async fn run(self, ct: CancellationToken, name: &str) -> Result<bool> {
     let self2 = self.clone();
     let command: Command = self2.try_into()?;
@@ -393,18 +393,18 @@ impl CommandExt for &Job {
   }
 }
 
-impl CommandExt for &JobDefination {
+impl CommandExt for &Job {
   async fn run(self, ct: CancellationToken, name: &str) -> Result<bool> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.run(ct, name).await,
-      JobDefination::Job(job) => job.run(ct, name).await,
+      Job::Cmdline(cmdline) => cmdline.run(ct, name).await,
+      Job::Job(job) => job.run(ct, name).await,
     }
   }
 
   async fn success(self, timeout: u64) -> Result<bool> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.success(timeout).await,
-      JobDefination::Job(job) => job.success(timeout).await,
+      Job::Cmdline(cmdline) => cmdline.success(timeout).await,
+      Job::Job(job) => job.success(timeout).await,
     }
   }
 }
@@ -418,7 +418,7 @@ impl JobExt for &Cmdline {
   async fn delay(self, _: &str, _: CancellationToken) -> Result<()> { Ok(()) }
 
   async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool> {
-    let job = Job {
+    let job = SingleJob {
       cmd: self.clone(),
       workdir: None,
       env: None,
@@ -431,7 +431,7 @@ impl JobExt for &Cmdline {
   }
 }
 
-impl JobExt for &Job {
+impl JobExt for &SingleJob {
   async fn delay(self, name: &str, ct: CancellationToken) -> Result<()> {
     if let Some(delay) = &self.delay {
       match delay {
@@ -494,23 +494,23 @@ impl JobExt for &Job {
   }
 }
 
-impl JobExt for &JobDefination {
+impl JobExt for &Job {
   async fn delay(self, name: &str, ct: CancellationToken) -> Result<()> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.delay(name, ct).await,
-      JobDefination::Job(job) => job.delay(name, ct).await,
+      Job::Cmdline(cmdline) => cmdline.delay(name, ct).await,
+      Job::Job(job) => job.delay(name, ct).await,
     }
   }
 
   async fn run_with_retry(self, name: &str, ct: CancellationToken) -> Result<bool> {
     match self {
-      JobDefination::Cmdline(cmdline) => cmdline.run_with_retry(name, ct).await,
-      JobDefination::Job(job) => job.run_with_retry(name, ct).await,
+      Job::Cmdline(cmdline) => cmdline.run_with_retry(name, ct).await,
+      Job::Job(job) => job.run_with_retry(name, ct).await,
     }
   }
 }
 
-impl JobDefination {
+impl Job {
   async fn run(self, ct: CancellationToken, name: &String) {
     if let Err(e) = self.delay(name, ct.clone()).await {
       format_to_console_err!(name, "Failed to delay job, error: {e}");
@@ -522,11 +522,11 @@ impl JobDefination {
   }
 }
 
-async fn run_jobs<TJobs>(jobs: TJobs) -> Result<()>
+async fn run_jobs<AsJobs>(jobs: AsJobs) -> Result<()>
 where
-  TJobs: IntoIterator<Item = (String, JobDefination)>,
-  TJobs::IntoIter: Send,
-  TJobs::Item: Send,
+  AsJobs: IntoIterator<Item = (String, Job)>,
+  AsJobs::IntoIter: Send,
+  AsJobs::Item: Send,
 {
   let ct = CancellationToken::new();
   let mut js: JoinSet<()> = JoinSet::new();
