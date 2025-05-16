@@ -129,8 +129,15 @@ enum JobDefination {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum Jobs {
+  Single(HashMap<String, JobDefination>),
+  Multiple(Vec<HashMap<String, JobDefination>>),
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
-  jobs: HashMap<String, JobDefination>,
+  jobs: Jobs,
 }
 
 impl Config {
@@ -515,11 +522,11 @@ impl JobDefination {
   }
 }
 
-async fn run_jobs<Jobs>(jobs: Jobs) -> Result<()>
+async fn run_jobs<TJobs>(jobs: TJobs) -> Result<()>
 where
-  Jobs: IntoIterator<Item = (String, JobDefination)>,
-  Jobs::IntoIter: Send,
-  Jobs::Item: Send,
+  TJobs: IntoIterator<Item = (String, JobDefination)>,
+  TJobs::IntoIter: Send,
+  TJobs::Item: Send,
 {
   let ct = CancellationToken::new();
   let mut js: JoinSet<()> = JoinSet::new();
@@ -551,6 +558,16 @@ async fn main() -> Result<()> {
   let args = Args::parse();
   let config: Config = args.try_into()?;
 
-  run_jobs(config.jobs).await?;
+  match config.jobs {
+    Jobs::Single(job) => {
+      run_jobs(job).await?;
+    }
+    Jobs::Multiple(jobs) => {
+      for (index, job) in jobs.into_iter().enumerate() {
+        println!("Running job set {index}:");
+        run_jobs(job).await?;
+      }
+    }
+  }
   Ok(())
 }
