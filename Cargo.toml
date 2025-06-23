@@ -1,7 +1,15 @@
 [package]
-name = "pa"
+name = "pa-run"
 version = "0.1.0"
 edition = "2024"
+authors = ["Koi to Coco<koitococ@outlook.com>"]
+description = "Parallel job runner"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/koitococo/pa"
+
+[[bin]]
+name = "pa"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.98"
