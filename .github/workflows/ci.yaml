@@ -8,15 +8,6 @@ jobs:
     name: Build
     strategy:
       matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
         include:
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -63,20 +54,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}-nightly
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --bins -Z unstable-options --artifact-dir ./artifacts
 
       - name: Upload Artifact
-        if: success() && !contains(matrix.target, 'windows')
         uses: actions/upload-artifact@v4
         with:
-          name: pa-${{ matrix.target }}-nightly
-          path: |
-            target/${{ matrix.target }}/release/pa
-
-      - name: Upload Artifact (Windows)
-        if: success() && contains(matrix.target, 'windows')
-        uses: actions/upload-artifact@v4
-        with:
-          name: pa-${{ matrix.target }}-nightly.exe
-          path: |
-            target/${{ matrix.target }}/release/pa.exe
+          name: ${{ matrix.target }}-nightly
+          path: ./artifacts/*
